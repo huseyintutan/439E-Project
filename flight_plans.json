@@ -1,0 +1,51 @@
+[
+    {
+      "name": "Flight 1",
+      "initial": {
+        "lambda": 5,
+        "phi": 40,
+        "h": 8000,
+        "v": 210,
+        "psi": 0,
+        "m": 68000
+      },
+      "target": {
+        "lambda": 32,
+        "phi": 40,
+        "h": 8000
+      }
+    },
+    {
+      "name": "Flight 2",
+      "initial": {
+        "lambda": 30,
+        "phi": 55,
+        "h": 7000,
+        "v": 220,
+        "psi": 40,
+        "m": 67000
+      },
+      "target": {
+        "lambda": 15,
+        "phi": 40,
+        "h": 9000
+      }
+    },
+    {
+      "name": "Flight 3",
+      "initial": {
+        "lambda": 32,
+        "phi": 45,
+        "h": 8000,
+        "v": 210,
+        "psi": 180,
+        "m": 65000
+      },
+      "target": {
+        "lambda": 5,
+        "phi": 45,
+        "h": 7000
+      }
+    }
+  ]
+  
