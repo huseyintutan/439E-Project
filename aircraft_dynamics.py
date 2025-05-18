@@ -20,7 +20,11 @@ def wind_field(x, y, coeffs):
     return sum(c*t for c, t in zip(coeffs, terms))
 
 def compute_rho(h):
-    return 1.225 * (1 - 2.2257e-5 * h) ** 4.2561
+    term = 1 - 2.2257e-5 * h
+    if term <= 0:
+        return 0.0  # atmosferin üst katmanlarında yoğunluk sıfıra çok yakın
+    return 1.225 * term ** 4.2561
+
 
 def compute_thrust_max(h):
     C0, C1, C2, C3 = THR
