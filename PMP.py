@@ -7,45 +7,45 @@ class AircraftModel:
     def __init__(self):
         self.g = 9.81
         self.rho_0 = 1.225
-        
+
         self.S = 124.65
         self.C_D0 = 0.025452
         self.k = 0.035815
-        
+
         self.Cf1 = 0.92958
         self.Cf2 = 0.70057
         self.Cf3 = 1068.1
-        
+
         self.CT1 = 0.95
         self.CT2_1 = 146590
         self.CT2_2 = 53872
         self.CT2_3 = 3.0453e-11
-        
+
         self.wx_coef = np.array([-21.151, 10.0039, 1.1081, -0.5239, -0.1297, -0.006, 0.0073, 0.0066, -0.0001])
         self.wy_coef = np.array([-65.3035, 17.6148, 1.0855, -0.7001, -0.5508, -0.003, 0.0241, 0.0064, -0.000227])
-    
+
     def air_density(self, h):
         return self.rho_0 * (1 - (2.2257e-5) * h) ** 4.2586
-    
+
     def lift_coefficient(self, m, rho, v, mu):
         return (2 * m * self.g) / (rho * self.S * v**2 * np.cos(mu))
-    
+
     def drag_coefficient(self, C_L):
         return self.C_D0 + self.k * C_L**2
-    
+
     def thrust_max(self, h):
         return self.CT1 * (1 - (3.28 * h) / self.CT2_2 + self.CT2_3 * (3.28 * h)**2)
-    
+
     def eta(self, v):
         return (self.Cf1 / 60000) * (1 + (1.943 * v) / self.Cf2)
-    
+
     def fuel_flow(self, delta, thr_max, eta):
         return delta * thr_max * eta * self.Cf1
-    
+
     def wind_speed(self, lon, lat):
         c_x = self.wx_coef
         c_y = self.wy_coef
-        
+
         terms = [
             1,
             lon,
@@ -57,36 +57,35 @@ class AircraftModel:
             lon * lat**2,
             lon**2 * lat**2
         ]
-        
+
         W_x = sum(c_x[i] * terms[i] for i in range(len(terms)))
         W_y = sum(c_y[i] * terms[i] for i in range(len(terms)))
-        
+
         return W_x, W_y
-    
+
     def dynamics(self, t, state, controls):
         x, y, h, v, psi, m = state
         gamma, mu, delta = controls
-        
+
         rho = self.air_density(h)
         W_x, W_y = self.wind_speed(x, y)
-        
+
         C_L = self.lift_coefficient(m, rho, v, mu)
         C_D = self.drag_coefficient(C_L)
-        
+
         thr_max = self.thrust_max(h)
         thrust = delta * thr_max
         eta_val = self.eta(v)
         f = self.fuel_flow(delta, thr_max, eta_val)
-        
+
         x_dot = v * np.cos(psi) * np.cos(gamma) + W_x
         y_dot = v * np.sin(psi) * np.cos(gamma) + W_y
         h_dot = v * np.sin(gamma)
         v_dot = (thrust / m) - self.g * np.sin(gamma) - (C_D * self.S * rho * v**2) / (2 * m)
         psi_dot = (C_L * self.S * rho * v) / (2 * m) * np.sin(mu) / np.cos(gamma)
         m_dot = -f
-        
-        return [x_dot, y_dot, h_dot, v_dot, psi_dot, m_dot]
 
+        return [x_dot, y_dot, h_dot, v_dot, psi_dot, m_dot]
 
 class DirectCollocation:
     def __init__(self, aircraft_model, initial_state, target_state, n_nodes=20):
@@ -94,12 +93,13 @@ class DirectCollocation:
         self.x0 = initial_state
         self.xf = target_state
         self.n_nodes = n_nodes
-        
+
         self.gamma_bounds = (-0.2, 0.2)
         self.mu_bounds = (-np.pi/4, np.pi/4)
         self.delta_bounds = (0.1, 1.0)
-        
-        self.tf_guess = 3600  # seconds (1 hour)
+
+        self.tf_guess = 1000  # daha gerçekçi uçuş süresi tahmini
+
         
     def setup_optimization(self):
         n = self.n_nodes
@@ -173,17 +173,17 @@ class DirectCollocation:
         n = self.n_nodes
         tf = x[-1]
         dt = tf / (n - 1)
-        
-        # Calculate cost (time + fuel)
-        cost = 0.05 * tf  # Time cost
-        
-        # Add fuel cost
+
+        cost = 0.05 * tf
+
         for i in range(n-1):
-            idx_start = i * 9
-            m_i = x[idx_start + 5]
-            m_next = x[idx_start + 9 + 5]
-            cost += 0.05 * (m_i - m_next)  # Fuel consumption cost
-        
+            idx = i * 9
+            m_i = x[idx + 5]
+            m_next = x[idx + 9 + 5]
+            delta_i = x[idx + 8]
+            cost += 0.05 * (m_i - m_next)
+            cost += 10.0 * (1.0 - delta_i)**2
+
         return cost
     
     def constraint_function(self, x):
