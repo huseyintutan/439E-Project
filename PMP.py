@@ -107,93 +107,100 @@ class DirectCollocation:
         
         # Estimate time in seconds (assuming ~800 km/h cruise speed)
         self.tf_guess = dist * 4.5  # More realistic estimate
-        
+            
     def setup_optimization(self):
         n = self.n_nodes
-        n_vars = n * (6 + 3) + 1  # states + controls + tf
+        n_vars = n * (6 + 3) + 1
         x_guess = np.zeros(n_vars)
 
-        # Make better initial guesses
+        # Calculate direct path parameters
+        dx = self.xf[0] - self.x0[0]
+        dy = self.xf[1] - self.x0[1]
+        dh = self.xf[2] - self.x0[2]
+        
+        # Direct heading
+        target_heading = np.arctan2(dy, dx)
+        if target_heading < 0:
+            target_heading += 2 * np.pi
+        
+        # FORCE trajectory to follow direct path closely
         for i in range(n):
             idx_start = i * 9
             alpha = i / (n - 1)
             
-            # State variables
-            # Linear interpolation for position and altitude
-            for j in range(3):
-                x_guess[idx_start + j] = (1 - alpha) * self.x0[j] + alpha * self.xf[j]
+            # State variables - STICK TO DIRECT PATH
+            x_guess[idx_start] = self.x0[0] + alpha * dx
+            x_guess[idx_start + 1] = self.x0[1] + alpha * dy
+            x_guess[idx_start + 2] = self.x0[2] + alpha * dh
             
-            # Speed varies smoothly (slight decrease during climb, etc.)
-            x_guess[idx_start + 3] = self.x0[3] * (1 - 0.05 * np.sin(np.pi * alpha))
+            # Constant speed
+            x_guess[idx_start + 3] = self.x0[3]
             
-            # Heading turns gradually toward destination
-            target_heading = np.arctan2(self.xf[1] - self.x0[1], self.xf[0] - self.x0[0])
-            if target_heading < 0:
-                target_heading += 2 * np.pi
+            # CONSTANT heading towards target (no turning!)
+            x_guess[idx_start + 4] = target_heading
             
-            initial_heading = self.x0[4]
-            diff = target_heading - initial_heading
-            # Ensure we take the shorter path
-            if diff > np.pi:
-                diff -= 2 * np.pi
-            elif diff < -np.pi:
-                diff += 2 * np.pi
-                
-            x_guess[idx_start + 4] = initial_heading + alpha * diff
+            # Linear mass decrease
+            x_guess[idx_start + 5] = self.x0[5] * (1 - 0.03 * alpha)
             
-            # Mass decreases gradually
-            x_guess[idx_start + 5] = self.x0[5] * (1 - 0.05 * alpha)
-            
-            # Control variables with smoother profile
-            # Flight path angle - slight climb then descent
-            x_guess[idx_start + 6] = 0.05 * np.sin(np.pi * alpha)
-            
-            # Bank angle - varies to turn toward destination
-            if i < n/3 or i > 2*n/3:
-                # Bank more at beginning and end for turns
-                turn_factor = 0.2 * np.sin(3 * np.pi * alpha)
-                if diff < 0:
-                    turn_factor *= -1
-                x_guess[idx_start + 7] = turn_factor
+            # Control variables - MINIMAL MANEUVERING
+            # Very small climb/descent
+            if dh != 0:
+                x_guess[idx_start + 6] = np.sign(dh) * 0.01  # Tiny climb/descent
             else:
-                x_guess[idx_start + 7] = 0.0
+                x_guess[idx_start + 6] = 0.0
             
-            # Throttle - higher during climb, lower during cruise
-            if i < n/5:
-                x_guess[idx_start + 8] = 0.85  # Initial climb
-            elif i > 4*n/5:
-                x_guess[idx_start + 8] = 0.6   # Final approach
-            else:
-                x_guess[idx_start + 8] = 0.7   # Cruise
-
-        # Final time estimate
+            # NO BANK ANGLE (straight flight)
+            x_guess[idx_start + 7] = 0.0
+            
+            # Constant cruise throttle
+            x_guess[idx_start + 8] = 0.65
+        
+        # Estimate direct flight time more accurately
+        direct_dist_km = np.sqrt(dx**2 + dy**2) * 111  # Approx km
+        cruise_speed_kmh = self.x0[3] * 3.6  # Convert m/s to km/h
+        self.tf_guess = (direct_dist_km / cruise_speed_kmh) * 3600  # Convert to seconds
+        
         x_guess[-1] = self.tf_guess
 
-        # Define bounds with more realistic constraints
+        # MUCH TIGHTER bounds to force straight trajectory
         bounds = []
         for i in range(n):
-            # State bounds
-            bounds.append((0, 60))  # Longitude
-            bounds.append((35, 60))  # Latitude
-            bounds.append((5000, 12000))  # Altitude
-            bounds.append((150, 270))  # Speed (m/s) - more realistic max
-            bounds.append((-2*np.pi, 2*np.pi))  # Heading
-            bounds.append((self.x0[5] * 0.8, self.x0[5]))  # Mass
+            # Allow small deviations from direct path only
+            expected_x = self.x0[0] + (i / (n - 1)) * dx
+            expected_y = self.x0[1] + (i / (n - 1)) * dy
+            expected_h = self.x0[2] + (i / (n - 1)) * dh
             
-            # Control bounds
-            bounds.append(self.gamma_bounds)  # Flight path angle
-            bounds.append(self.mu_bounds)  # Bank angle
-            bounds.append(self.delta_bounds)  # Throttle
+            # Position bounds - very tight around direct path
+            bounds.append((expected_x - 1.5, expected_x + 1.5))  # ±1.5 deg longitude
+            bounds.append((expected_y - 1.5, expected_y + 1.5))  # ±1.5 deg latitude
+            bounds.append((expected_h - 500, expected_h + 500))  # ±500m altitude
+            
+            # Speed bounds
+            bounds.append((self.x0[3] * 0.9, self.x0[3] * 1.1))  # ±10% speed
+            
+            # Heading bounds - tight around target heading
+            bounds.append((target_heading - np.pi/8, target_heading + np.pi/8))  # ±22.5°
+            
+            # Mass bounds
+            bounds.append((self.x0[5] * 0.85, self.x0[5]))
+            
+            # Control bounds - VERY RESTRICTIVE
+            bounds.append((-0.05, 0.05))         # Flight path: ±2.9°
+            bounds.append((-np.pi/20, np.pi/20)) # Bank angle: ±9°
+            bounds.append((0.4, 0.8))            # Throttle
+        
+        # Time bounds
+        bounds.append((self.tf_guess * 0.9, self.tf_guess * 1.1))
 
-        # Flight time bounds
-        min_time = self.tf_guess * 0.7  # Allow some flexibility
-        max_time = self.tf_guess * 1.5
-        bounds.append((min_time, max_time))
-
-        # Number of constraints: continuity + boundary
-        n_constraints = 6 * (n-1) + 6
+        # Calculate number of constraints
+        n_constraints = 6 + 6*(n-1) + 3  # Initial + dynamics + terminal
+        n_constraints += (n-2)           # Path constraints
+        n_constraints += 2*(n-1)         # Heading rate constraints  
+        n_constraints += 2*(n-2)         # Heading acceleration constraints
+        n_constraints += (n-1)           # Segment direction constraints
+        
         return x_guess, bounds, n_constraints
-    
+        
     def objective_function(self, x):
         n = self.n_nodes
         tf = x[-1]
