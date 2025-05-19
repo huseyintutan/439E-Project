@@ -103,70 +103,38 @@ class DirectCollocation:
         
     def setup_optimization(self):
         n = self.n_nodes
-        
-        # Decision variables per node: 6 states + 3 controls
-        n_vars = n * (6 + 3) + 1  # +1 for final time
-        
-        # Initial guess
+        n_vars = n * (6 + 3) + 1
         x_guess = np.zeros(n_vars)
-        
-        # Set initial guess for states (linear interpolation from initial to target)
+
         for i in range(n):
-            # States (linearly interpolated from x0 to xf)
             idx_start = i * 9
             alpha = i / (n - 1)
-            for j in range(3):  # For x, y, h
+            for j in range(3):
                 x_guess[idx_start + j] = (1 - alpha) * self.x0[j] + alpha * self.xf[j]
-            
-            # Velocity - constant
             x_guess[idx_start + 3] = self.x0[3]
-            
-            # Heading angle - constant
             x_guess[idx_start + 4] = self.x0[4]
-            
-            # Mass - linearly decreasing (assume 5% reduction)
             x_guess[idx_start + 5] = self.x0[5] * (1 - 0.05 * alpha)
-            
-            # Controls (reasonable initial values)
-            x_guess[idx_start + 6] = 0.0  # gamma
-            x_guess[idx_start + 7] = 0.0  # mu
-            x_guess[idx_start + 8] = 0.5  # delta
-        
-        # Final time
+            x_guess[idx_start + 6] = 0.0
+            x_guess[idx_start + 7] = 0.0
+            x_guess[idx_start + 8] = 0.5
+
         x_guess[-1] = self.tf_guess
-        
-        # Bounds for variables
+
         bounds = []
-        
-        # State bounds
         for i in range(n):
-            # Position bounds (wide)
-            bounds.append((0, 60))  # longitude
-            bounds.append((35, 60))  # latitude
-            
-            # Altitude bounds
-            bounds.append((5000, 12000))  # meters
-            
-            # Velocity bounds
-            bounds.append((150, 300))  # m/s
-            
-            # Heading bounds
-            bounds.append((-2*np.pi, 2*np.pi))  # radians
-            
-            # Mass bounds
-            bounds.append((self.x0[5] * 0.7, self.x0[5]))  # kg
-            
-            # Control bounds
-            bounds.append(self.gamma_bounds)  # gamma
-            bounds.append(self.mu_bounds)     # mu
-            bounds.append(self.delta_bounds)  # delta
-        
-        # Final time bounds
-        bounds.append((1000, 10000))  # seconds
-        
-        # Define constraints
-        n_constraints = 6 * (n-1) + 3  # Dynamics + terminal constraints
-        
+            bounds.append((0, 60))
+            bounds.append((35, 60))
+            bounds.append((5000, 12000))
+            bounds.append((150, 300))
+            bounds.append((-2*np.pi, 2*np.pi))
+            bounds.append((self.x0[5] * 0.7, self.x0[5]))
+            bounds.append(self.gamma_bounds)
+            bounds.append(self.mu_bounds)
+            bounds.append(self.delta_bounds)
+
+        bounds.append((500, 5000))  # tf sınırı gevşetildi
+
+        n_constraints = 6 * (n-1) + 3
         return x_guess, bounds, n_constraints
     
     def objective_function(self, x):
@@ -174,15 +142,58 @@ class DirectCollocation:
         tf = x[-1]
         dt = tf / (n - 1)
 
-        cost = 0.05 * tf
+        cost = 0.0
+        delta_sum = 0.0
 
         for i in range(n-1):
             idx = i * 9
             m_i = x[idx + 5]
             m_next = x[idx + 9 + 5]
             delta_i = x[idx + 8]
-            cost += 0.05 * (m_i - m_next)
+            psi_i = x[idx + 4]
+            psi_next = x[idx + 9 + 4]
+            v_i = x[idx + 3]
+
+            fuel_cost = m_i - m_next
+            cost += 1.0 * fuel_cost
             cost += 10.0 * (1.0 - delta_i)**2
+            cost += 0.01 * (v_i - 170)**2
+
+            if delta_i > 0.9:
+                cost += 20.0 * (delta_i - 0.9)**2
+
+            dpsi = psi_next - psi_i
+            cost += 5.0 * dpsi**2
+
+            delta_sum += delta_i
+
+        for i in range(n-2):
+            idx_i = i * 9
+            idx_ip1 = (i + 1) * 9
+
+            gamma_diff = x[idx_i + 6] - x[idx_ip1 + 6]
+            mu_diff = x[idx_i + 7] - x[idx_ip1 + 7]
+            delta_diff = x[idx_i + 8] - x[idx_ip1 + 8]
+
+            cost += 5.0 * (gamma_diff**2 + mu_diff**2 + delta_diff**2)
+
+        delta_mean = delta_sum / (n - 1)
+        if delta_mean > 0.8:
+            cost += 100.0 * (delta_mean - 0.8)**2
+
+        cost += 0.01 * tf
+
+        min_tf = 1200
+        if tf < min_tf:
+            cost += 100.0 * (min_tf - tf)**2
+
+        # Midway waypoint penalty
+        mid_idx = (n//2) * 9
+        x_mid = x[mid_idx]
+        y_mid = x[mid_idx + 1]
+        x_target = (self.x0[0] + self.xf[0]) / 2
+        y_target = (self.x0[1] + self.xf[1]) / 2
+        cost += 10.0 * ((x_mid - x_target)**2 + (y_mid - y_target)**2)
 
         return cost
     
