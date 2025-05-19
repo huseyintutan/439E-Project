@@ -87,54 +87,111 @@ class AircraftModel:
 
         return [x_dot, y_dot, h_dot, v_dot, psi_dot, m_dot]
 
+
 class DirectCollocation:
-    def __init__(self, aircraft_model, initial_state, target_state, n_nodes=20):
+    def __init__(self, aircraft_model, initial_state, target_state, n_nodes=30):
         self.aircraft = aircraft_model
         self.x0 = initial_state
         self.xf = target_state
         self.n_nodes = n_nodes
 
-        self.gamma_bounds = (-0.2, 0.2)
-        self.mu_bounds = (-np.pi/4, np.pi/4)
-        self.delta_bounds = (0.1, 1.0)
+        # Adjust bounds for better convergence
+        self.gamma_bounds = (-0.15, 0.15)  # Slightly narrower
+        self.mu_bounds = (-np.pi/6, np.pi/6)  # Less aggressive bank
+        self.delta_bounds = (0.2, 0.9)     # More realistic throttle range
 
-        self.tf_guess = 1000  # daha gerçekçi uçuş süresi tahmini
-
+        # Estimate flight time based on distance
+        dx = self.xf[0] - self.x0[0]
+        dy = self.xf[1] - self.x0[1]
+        dist = np.sqrt(dx**2 + dy**2) * 111  # Approx km (1 degree ≈ 111 km)
+        
+        # Estimate time in seconds (assuming ~800 km/h cruise speed)
+        self.tf_guess = dist * 4.5  # More realistic estimate
         
     def setup_optimization(self):
         n = self.n_nodes
-        n_vars = n * (6 + 3) + 1
+        n_vars = n * (6 + 3) + 1  # states + controls + tf
         x_guess = np.zeros(n_vars)
 
+        # Make better initial guesses
         for i in range(n):
             idx_start = i * 9
             alpha = i / (n - 1)
+            
+            # State variables
+            # Linear interpolation for position and altitude
             for j in range(3):
                 x_guess[idx_start + j] = (1 - alpha) * self.x0[j] + alpha * self.xf[j]
-            x_guess[idx_start + 3] = self.x0[3]
-            x_guess[idx_start + 4] = self.x0[4]
+            
+            # Speed varies smoothly (slight decrease during climb, etc.)
+            x_guess[idx_start + 3] = self.x0[3] * (1 - 0.05 * np.sin(np.pi * alpha))
+            
+            # Heading turns gradually toward destination
+            target_heading = np.arctan2(self.xf[1] - self.x0[1], self.xf[0] - self.x0[0])
+            if target_heading < 0:
+                target_heading += 2 * np.pi
+            
+            initial_heading = self.x0[4]
+            diff = target_heading - initial_heading
+            # Ensure we take the shorter path
+            if diff > np.pi:
+                diff -= 2 * np.pi
+            elif diff < -np.pi:
+                diff += 2 * np.pi
+                
+            x_guess[idx_start + 4] = initial_heading + alpha * diff
+            
+            # Mass decreases gradually
             x_guess[idx_start + 5] = self.x0[5] * (1 - 0.05 * alpha)
-            x_guess[idx_start + 6] = 0.0
-            x_guess[idx_start + 7] = 0.0
-            x_guess[idx_start + 8] = 0.5
+            
+            # Control variables with smoother profile
+            # Flight path angle - slight climb then descent
+            x_guess[idx_start + 6] = 0.05 * np.sin(np.pi * alpha)
+            
+            # Bank angle - varies to turn toward destination
+            if i < n/3 or i > 2*n/3:
+                # Bank more at beginning and end for turns
+                turn_factor = 0.2 * np.sin(3 * np.pi * alpha)
+                if diff < 0:
+                    turn_factor *= -1
+                x_guess[idx_start + 7] = turn_factor
+            else:
+                x_guess[idx_start + 7] = 0.0
+            
+            # Throttle - higher during climb, lower during cruise
+            if i < n/5:
+                x_guess[idx_start + 8] = 0.85  # Initial climb
+            elif i > 4*n/5:
+                x_guess[idx_start + 8] = 0.6   # Final approach
+            else:
+                x_guess[idx_start + 8] = 0.7   # Cruise
 
+        # Final time estimate
         x_guess[-1] = self.tf_guess
 
+        # Define bounds with more realistic constraints
         bounds = []
         for i in range(n):
-            bounds.append((0, 60))
-            bounds.append((35, 60))
-            bounds.append((5000, 12000))
-            bounds.append((150, 300))
-            bounds.append((-2*np.pi, 2*np.pi))
-            bounds.append((self.x0[5] * 0.7, self.x0[5]))
-            bounds.append(self.gamma_bounds)
-            bounds.append(self.mu_bounds)
-            bounds.append(self.delta_bounds)
+            # State bounds
+            bounds.append((0, 60))  # Longitude
+            bounds.append((35, 60))  # Latitude
+            bounds.append((5000, 12000))  # Altitude
+            bounds.append((150, 270))  # Speed (m/s) - more realistic max
+            bounds.append((-2*np.pi, 2*np.pi))  # Heading
+            bounds.append((self.x0[5] * 0.8, self.x0[5]))  # Mass
+            
+            # Control bounds
+            bounds.append(self.gamma_bounds)  # Flight path angle
+            bounds.append(self.mu_bounds)  # Bank angle
+            bounds.append(self.delta_bounds)  # Throttle
 
-        bounds.append((500, 5000))  # tf sınırı gevşetildi
+        # Flight time bounds
+        min_time = self.tf_guess * 0.7  # Allow some flexibility
+        max_time = self.tf_guess * 1.5
+        bounds.append((min_time, max_time))
 
-        n_constraints = 6 * (n-1) + 3
+        # Number of constraints: continuity + boundary
+        n_constraints = 6 * (n-1) + 6
         return x_guess, bounds, n_constraints
     
     def objective_function(self, x):
@@ -142,60 +199,78 @@ class DirectCollocation:
         tf = x[-1]
         dt = tf / (n - 1)
 
-        cost = 0.0
-        delta_sum = 0.0
-
+        # Initialize cost components
+        fuel_cost_total = 0.0
+        time_cost = 0.05 * tf  # Time cost component (scaled)
+        control_smoothness_cost = 0.0
+        terminal_cost = 0.0
+        
+        # Calculate costs
         for i in range(n-1):
             idx = i * 9
+            
+            # Extract states and controls
             m_i = x[idx + 5]
             m_next = x[idx + 9 + 5]
+            gamma_i = x[idx + 6]
+            mu_i = x[idx + 7]
             delta_i = x[idx + 8]
-            psi_i = x[idx + 4]
-            psi_next = x[idx + 9 + 4]
             v_i = x[idx + 3]
-
+            
+            # Fuel consumption cost
             fuel_cost = m_i - m_next
-            cost += 1.0 * fuel_cost
-            cost += 10.0 * (1.0 - delta_i)**2
-            cost += 0.01 * (v_i - 170)**2
+            fuel_cost_total += fuel_cost
+            
+            # Penalize extreme throttle settings
+            if delta_i > 0.85:
+                control_smoothness_cost += 50.0 * (delta_i - 0.85)**2
+            elif delta_i < 0.3:
+                control_smoothness_cost += 50.0 * (0.3 - delta_i)**2
+            
+            # Penalize extreme flight path angles
+            if abs(gamma_i) > 0.1:
+                control_smoothness_cost += 100.0 * (abs(gamma_i) - 0.1)**2
+            
+            # Penalize extreme bank angles
+            if abs(mu_i) > np.pi/8:
+                control_smoothness_cost += 50.0 * (abs(mu_i) - np.pi/8)**2
+            
+            # Speed constraint - prefer efficient cruise speed
+            if abs(v_i - 220) > 30:
+                control_smoothness_cost += 5.0 * (abs(v_i - 220) - 30)**2
 
-            if delta_i > 0.9:
-                cost += 20.0 * (delta_i - 0.9)**2
-
-            dpsi = psi_next - psi_i
-            cost += 5.0 * dpsi**2
-
-            delta_sum += delta_i
-
+        # Control rate smoothness
         for i in range(n-2):
             idx_i = i * 9
             idx_ip1 = (i + 1) * 9
-
-            gamma_diff = x[idx_i + 6] - x[idx_ip1 + 6]
-            mu_diff = x[idx_i + 7] - x[idx_ip1 + 7]
-            delta_diff = x[idx_i + 8] - x[idx_ip1 + 8]
-
-            cost += 5.0 * (gamma_diff**2 + mu_diff**2 + delta_diff**2)
-
-        delta_mean = delta_sum / (n - 1)
-        if delta_mean > 0.8:
-            cost += 100.0 * (delta_mean - 0.8)**2
-
-        cost += 0.01 * tf
-
-        min_tf = 1200
-        if tf < min_tf:
-            cost += 100.0 * (min_tf - tf)**2
-
-        # Midway waypoint penalty
-        mid_idx = (n//2) * 9
-        x_mid = x[mid_idx]
-        y_mid = x[mid_idx + 1]
-        x_target = (self.x0[0] + self.xf[0]) / 2
-        y_target = (self.x0[1] + self.xf[1]) / 2
-        cost += 10.0 * ((x_mid - x_target)**2 + (y_mid - y_target)**2)
-
-        return cost
+            
+            dgamma = x[idx_ip1 + 6] - x[idx_i + 6]
+            dmu = x[idx_ip1 + 7] - x[idx_i + 7]
+            ddelta = x[idx_ip1 + 8] - x[idx_i + 8]
+            
+            # Penalize rapid control changes
+            control_smoothness_cost += 20.0 * dt * (
+                (dgamma/dt)**2 + 
+                (dmu/dt)**2 + 
+                (ddelta/dt)**2
+            )
+        
+        # Terminal conditions cost
+        end_idx = (n-1) * 9
+        x_end = x[end_idx]
+        y_end = x[end_idx + 1]
+        h_end = x[end_idx + 2]
+        
+        terminal_cost = 1000.0 * (
+            (x_end - self.xf[0])**2 + 
+            (y_end - self.xf[1])**2 + 
+            (h_end - self.xf[2])**2 / 1000000  # Scale height error
+        )
+        
+        # Combine all cost components
+        total_cost = fuel_cost_total + time_cost + control_smoothness_cost + terminal_cost
+        
+        return total_cost
     
     def constraint_function(self, x):
         n = self.n_nodes
@@ -204,56 +279,79 @@ class DirectCollocation:
         
         constraints = []
         
-        # Extract initial state
-        x0_idx = 0
-        x0_extracted = x[x0_idx:x0_idx+6]
+        # Initial state constraints (all 6 states)
+        init_idx = 0
+        for i in range(6):
+            constraints.append(x[init_idx + i] - self.x0[i])
         
-        # Initial state constraints
-        for i in range(3):  # Only constrain x, y, h
-            constraints.append(x0_extracted[i] - self.x0[i])
-        
-        # Dynamics constraints
+        # Dynamics constraints using trapezoidal integration (more accurate than Euler)
         for i in range(n-1):
-            idx_start = i * 9
+            idx_i = i * 9
+            idx_ip1 = idx_i + 9
             
-            # Extract states and controls at current node
-            state_i = x[idx_start:idx_start+6]
-            controls_i = x[idx_start+6:idx_start+9]
+            # Extract states and controls at node i
+            state_i = x[idx_i:idx_i+6]
+            controls_i = x[idx_i+6:idx_i+9]
             
-            # Extract states at next node
-            state_next = x[idx_start+9:idx_start+15]
+            # Extract states at node i+1
+            state_ip1 = x[idx_ip1:idx_ip1+6]
+            controls_ip1 = x[idx_ip1+6:idx_ip1+9]
             
-            # Euler integration of dynamics
-            derivatives = self.aircraft.dynamics(0, state_i, controls_i)
-            state_next_euler = [state_i[j] + dt * derivatives[j] for j in range(6)]
+            # Compute derivatives at node i
+            deriv_i = self.aircraft.dynamics(0, state_i, controls_i)
             
-            # Add constraints for each state variable
+            # Compute derivatives at node i+1
+            deriv_ip1 = self.aircraft.dynamics(0, state_ip1, controls_ip1)
+            
+            # Trapezoidal integration
             for j in range(6):
-                constraints.append(state_next[j] - state_next_euler[j])
+                predicted = state_i[j] + 0.5 * dt * (deriv_i[j] + deriv_ip1[j])
+                constraints.append(state_ip1[j] - predicted)
         
         # Terminal constraints for position and altitude
         terminal_idx = (n-1) * 9
-        terminal_state = x[terminal_idx:terminal_idx+6]
-        
         for i in range(3):  # Only constrain x, y, h
-            constraints.append(terminal_state[i] - self.xf[i])
+            constraints.append(x[terminal_idx + i] - self.xf[i])
         
         return np.array(constraints)
     
     def solve(self):
         x_guess, bounds, n_constraints = self.setup_optimization()
         
+        # First attempt with looser tolerances to get closer to solution
         result = minimize(
             self.objective_function,
             x_guess,
             method='SLSQP',
             bounds=bounds,
             constraints={'type': 'eq', 'fun': self.constraint_function},
-            options={'maxiter': 500, 'disp': True}
+            options={
+                'maxiter': 300,
+                'ftol': 1e-6,
+                'eps': 1e-3,
+                'disp': True
+            }
         )
         
-        if not result.success:
-            print("Optimization failed:", result.message)
+        # Refine solution with tighter tolerances
+        if result.success:
+            print("Initial optimization successful, refining solution...")
+            result = minimize(
+                self.objective_function,
+                result.x,
+                method='SLSQP',
+                bounds=bounds,
+                constraints={'type': 'eq', 'fun': self.constraint_function},
+                options={
+                    'maxiter': 200,
+                    'ftol': 1e-8,
+                    'eps': 1e-5,
+                    'disp': True
+                }
+            )
+        else:
+            print("Initial optimization did not fully converge:", result.message)
+            print("Attempting to extract usable solution anyway...")
         
         # Extract results
         x_opt = result.x
@@ -270,7 +368,16 @@ class DirectCollocation:
             states[i] = x_opt[idx_start:idx_start+6]
             controls[i] = x_opt[idx_start+6:idx_start+9]
         
-        return t, states, controls
+        # Check final position error
+        final_pos_error = np.sqrt((states[-1, 0] - self.xf[0])**2 + 
+                                 (states[-1, 1] - self.xf[1])**2)
+        print(f"Final position error: {final_pos_error:.4f} degrees")
+        
+        # Check altitude error
+        alt_error = abs(states[-1, 2] - self.xf[2])
+        print(f"Final altitude error: {alt_error:.2f} meters")
+        
+        return t, states, controls, result.success
 
 
 def solve_flight_plan(flight_plan_number):
@@ -339,12 +446,24 @@ def solve_flight_plan(flight_plan_number):
         plan['destination']['lon'],
         plan['destination']['lat'],
         plan['destination']['h'],
-        0, 0, 0
+        0, 0, 0  # We don't constrain final velocity, heading or mass
     ]
     
-    optimizer = DirectCollocation(aircraft, initial_state, target_state, n_nodes=30)
+    # Estimate distance for each flight plan
+    dx = target_state[0] - initial_state[0]
+    dy = target_state[1] - initial_state[1]
+    dist_km = np.sqrt(dx**2 + dy**2) * 111  # Approx km (1 degree ≈ 111 km)
+    print(f"Flight {flight_plan_number} - Approximate distance: {dist_km:.1f} km")
     
-    t, states, controls = optimizer.solve()
+    # More nodes for longer flights
+    if dist_km > 2000:
+        n_nodes = 40
+    else:
+        n_nodes = 30
+    
+    optimizer = DirectCollocation(aircraft, initial_state, target_state, n_nodes=n_nodes)
+    
+    t, states, controls, success = optimizer.solve()
     
     flight_time = t[-1]
     initial_mass = states[0, 5]
@@ -354,6 +473,7 @@ def solve_flight_plan(flight_plan_number):
     print(f"Flight {flight_plan_number} Results:")
     print(f"Flight time: {flight_time/60:.2f} minutes")
     print(f"Fuel consumption: {fuel_consumption:.2f} kg")
+    print(f"Average speed: {dist_km/(flight_time/3600):.1f} km/h")
     
     plot_results(t, states, controls, flight_plan_number)
     
@@ -380,14 +500,38 @@ def plot_results(t, states, controls, flight_plan_number):
         thr_max = aircraft.thrust_max(h[i])
         thrust[i] = delta[i] * thr_max
     
-    plt.figure(figsize=(15, 10))
+    # Calculate fuel flow over time
+    fuel_flow = np.zeros_like(t)
+    for i in range(len(t)):
+        thr_max = aircraft.thrust_max(h[i])
+        eta_val = aircraft.eta(v[i])
+        fuel_flow[i] = aircraft.fuel_flow(delta[i], thr_max, eta_val)
     
+    # Calculate wind vectors for plotting
+    wind_x = np.zeros_like(t)
+    wind_y = np.zeros_like(t)
+    for i in range(len(t)):
+        wind_x[i], wind_y[i] = aircraft.wind_speed(x[i], y[i])
+    
+    plt.figure(figsize=(15, 12))
+    
+    # Trajectory plot with wind field arrows
     plt.subplot(3, 3, 1)
-    plt.plot(x, y)
+    plt.plot(x, y, 'b-', linewidth=2)
+    plt.plot(x[0], y[0], 'go', markersize=8, label='Start')
+    plt.plot(x[-1], y[-1], 'ro', markersize=8, label='End')
+    
+    # Add wind vectors (subsample for clarity)
+    arrow_indices = np.linspace(0, len(t)-1, 10).astype(int)
+    for i in arrow_indices:
+        plt.arrow(x[i], y[i], wind_x[i]/20, wind_y[i]/20, 
+                 head_width=0.2, head_length=0.3, fc='r', ec='r', alpha=0.5)
+    
     plt.xlabel('Longitude [deg]')
     plt.ylabel('Latitude [deg]')
-    plt.title('x-y Trajectory')
+    plt.title('x-y Trajectory with Wind')
     plt.grid(True)
+    plt.legend()
     
     plt.subplot(3, 3, 2)
     plt.plot(t_min, h)
@@ -438,11 +582,58 @@ def plot_results(t, states, controls, flight_plan_number):
     plt.title('Flight Path Angle vs Time')
     plt.grid(True)
     
+    plt.subplot(3, 3, 9)
+    plt.plot(t_min, fuel_flow)
+    plt.xlabel('Time [min]')
+    plt.ylabel('Fuel Flow [kg/s]')
+    plt.title('Fuel Flow vs Time')
+    plt.grid(True)
+    
     plt.tight_layout()
     plt.suptitle(f'Flight Plan {flight_plan_number} Results', fontsize=16)
     plt.subplots_adjust(top=0.92)
     
     plt.savefig(f'flight_plan_{flight_plan_number}_results.png')
+    plt.close()
+    
+    # Additional plot for wind field visualization
+    plt.figure(figsize=(10, 8))
+    
+    # Create a grid for wind field visualization
+    lon_grid = np.linspace(min(x)-5, max(x)+5, 20)
+    lat_grid = np.linspace(min(y)-5, max(y)+5, 20)
+    LON, LAT = np.meshgrid(lon_grid, lat_grid)
+    
+    # Calculate wind at each grid point
+    U = np.zeros_like(LON)
+    V = np.zeros_like(LAT)
+    for i in range(LON.shape[0]):
+        for j in range(LON.shape[1]):
+            U[i,j], V[i,j] = aircraft.wind_speed(LON[i,j], LAT[i,j])
+    
+    # Wind speed magnitude
+    wind_speed = np.sqrt(U**2 + V**2)
+    
+    # Plot wind field
+    plt.contourf(LON, LAT, wind_speed, cmap='viridis', alpha=0.5)
+    plt.colorbar(label='Wind Speed [m/s]')
+    
+    # Plot trajectory
+    plt.plot(x, y, 'r-', linewidth=2)
+    plt.plot(x[0], y[0], 'go', markersize=8, label='Start')
+    plt.plot(x[-1], y[-1], 'ro', markersize=8, label='End')
+    
+    # Plot wind vectors
+    plt.quiver(LON[::2, ::2], LAT[::2, ::2], U[::2, ::2], V[::2, ::2], 
+              scale=200, color='black', alpha=0.7)
+    
+    plt.xlabel('Longitude [deg]')
+    plt.ylabel('Latitude [deg]')
+    plt.title(f'Flight Plan {flight_plan_number} - Trajectory and Wind Field')
+    plt.grid(True)
+    plt.legend()
+    
+    plt.savefig(f'flight_plan_{flight_plan_number}_wind_field.png')
     plt.close()
 
 
