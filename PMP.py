@@ -764,7 +764,589 @@ class RobustDirectCollocation:
         else:
             print("Optimization failed!")
             return None, None, None, False
+
+class ConvergenceEnhancedCollocation:
+    def __init__(self, aircraft_model, initial_state, target_state, n_nodes=20):
+        self.aircraft = aircraft_model
+        self.x0 = initial_state
+        self.xf = target_state
+        self.n_nodes = n_nodes
+        
+        # Calculate basic parameters
+        dx = self.xf[0] - self.x0[0]
+        dy = self.xf[1] - self.x0[1]
+        self.dist_km = np.sqrt(dx**2 + dy**2) * 111.32
+        self.tf_guess = (self.dist_km * 1000) / 200  # Conservative speed
+        
+        print(f"Enhanced optimization for {self.dist_km:.0f} km flight")
+    
+    def solve(self):
+        # PHASE 1: Start with very simple problem
+        print("Phase 1: Simplified problem...")
+        result = self._solve_simplified()
+        
+        if result is None:
+            print("Phase 1 failed, trying alternative initialization...")
+            result = self._solve_with_alternative_init()
+        
+        if result is None:
+            print("All convergence attempts failed!")
+            return None, None, None, False
+        
+        # PHASE 2: Gradually add complexity
+        print("Phase 2: Adding complexity...")
+        result = self._refine_solution(result)
+        
+        # PHASE 3: Final polish
+        print("Phase 3: Final convergence...")
+        result = self._final_polish(result)
+        
+        # Extract and return
+        return self._extract_solution(result)
+    
+    def _solve_simplified(self):
+        """Solve with maximum simplifications"""
+        # Very simple objective: minimize time + large terminal penalty
+        def simple_objective(x):
+            n = self.n_nodes
+            tf = x[-1]
+            
+            # Just time cost and terminal penalty
+            cost = 0.1 * tf
+            
+            # Heavy terminal penalty  
+            end_idx = (n-1) * 9
+            terminal_cost = 10000.0 * (
+                (x[end_idx] - self.xf[0])**2 + 
+                (x[end_idx + 1] - self.xf[1])**2 + 
+                (x[end_idx + 2] - self.xf[2])**2 / 1e6
+            )
+            
+            return cost + terminal_cost
+        
+        # Simple constraints: just dynamics and terminals
+        def simple_constraints(x):
+            constraints = []
+            n = self.n_nodes
+            tf = x[-1]
+            dt = tf / (n - 1)
+            
+            # Initial conditions
+            for i in range(6):
+                constraints.append(x[i] - self.x0[i])
+            
+            # Simplified dynamics (Euler integration)
+            for i in range(n-1):
+                idx_i = i * 9
+                idx_ip1 = idx_i + 9
                 
+                state_i = x[idx_i:idx_i+6]
+                controls_i = x[idx_i+6:idx_i+9]
+                state_ip1 = x[idx_ip1:idx_ip1+6]
+                
+                deriv_i = self.aircraft.dynamics(0, state_i, controls_i)
+                
+                for j in range(6):
+                    predicted = state_i[j] + dt * deriv_i[j]
+                    constraints.append(state_ip1[j] - predicted)
+            
+            # Terminal position constraints
+            end_idx = (n-1) * 9
+            for i in range(3):
+                constraints.append(x[end_idx + i] - self.xf[i])
+            
+            return np.array(constraints)
+        
+        # Very loose bounds
+        x_guess, bounds = self._create_simple_guess()
+        
+        try:
+            result = minimize(
+                simple_objective,
+                x_guess,
+                method='SLSQP',
+                bounds=bounds,
+                constraints={'type': 'eq', 'fun': simple_constraints},
+                options={
+                    'maxiter': 300,
+                    'ftol': 1e-4,
+                    'eps': 1e-3,
+                    'disp': False
+                }
+            )
+            
+            if result.success:
+                print(f"  ✓ Simplified problem converged (cost: {result.fun:.2f})")
+                return result
+            else:
+                print(f"  ✗ Simplified problem failed: {result.message}")
+                return None
+                
+        except Exception as e:
+            print(f"  ✗ Simplified problem error: {e}")
+            return None
+    
+    def _solve_with_alternative_init(self):
+        """Try with straight-line initialization"""
+        print("  Trying straight-line initialization...")
+        
+        # Create perfectly straight path
+        x_guess = np.zeros(self.n_nodes * 9 + 1)
+        
+        for i in range(self.n_nodes):
+            idx = i * 9
+            alpha = i / (self.n_nodes - 1)
+            
+            # Linear interpolation for position
+            x_guess[idx] = self.x0[0] + alpha * (self.xf[0] - self.x0[0])
+            x_guess[idx + 1] = self.x0[1] + alpha * (self.xf[1] - self.x0[1])
+            x_guess[idx + 2] = self.x0[2] + alpha * (self.xf[2] - self.x0[2])
+            
+            # Constant speed and heading
+            x_guess[idx + 3] = self.x0[3]
+            x_guess[idx + 4] = np.arctan2(self.xf[1] - self.x0[1], self.xf[0] - self.x0[0])
+            if x_guess[idx + 4] < 0:
+                x_guess[idx + 4] += 2*np.pi
+            
+            # Linear mass decrease
+            x_guess[idx + 5] = self.x0[5] * (1 - 0.02 * alpha)
+            
+            # Minimal controls
+            x_guess[idx + 6] = 0.0  # No climb
+            x_guess[idx + 7] = 0.0  # No bank
+            x_guess[idx + 8] = 0.65  # Moderate throttle
+        
+        x_guess[-1] = self.tf_guess
+        
+        # Very wide bounds
+        bounds = []
+        for i in range(self.n_nodes):
+            bounds.extend([
+                (-180, 180), (-90, 90), (1000, 15000),  # Position
+                (100, 350), (0, 2*np.pi), (self.x0[5]*0.5, self.x0[5]),  # V, psi, m
+                (-0.1, 0.1), (-np.pi/12, np.pi/12), (0.4, 0.9)  # Controls
+            ])
+        bounds.append((self.tf_guess * 0.5, self.tf_guess * 2.0))
+        
+        # Try unconstrained first
+        def penalty_objective(x):
+            try:
+                # Simple quadratic penalties
+                cost = 0.1 * x[-1]  # Time
+                
+                # Dynamics penalty
+                n = self.n_nodes
+                tf = x[-1]
+                dt = tf / (n - 1)
+                
+                for i in range(n-1):
+                    idx_i = i * 9
+                    idx_ip1 = idx_i + 9
+                    
+                    state_i = x[idx_i:idx_i+6]
+                    controls_i = x[idx_i+6:idx_i+9]
+                    state_ip1 = x[idx_ip1:idx_ip1+6]
+                    
+                    deriv_i = self.aircraft.dynamics(0, state_i, controls_i)
+                    
+                    for j in range(6):
+                        predicted = state_i[j] + dt * deriv_i[j]
+                        error = state_ip1[j] - predicted
+                        cost += 1000.0 * error**2
+                
+                # Terminal penalty
+                end_idx = (n-1) * 9
+                cost += 50000.0 * (x[end_idx] - self.xf[0])**2
+                cost += 50000.0 * (x[end_idx + 1] - self.xf[1])**2
+                cost += 500.0 * (x[end_idx + 2] - self.xf[2])**2
+                
+                # Initial condition penalty
+                for i in range(6):
+                    cost += 10000.0 * (x[i] - self.x0[i])**2
+                
+                return cost
+            except:
+                return 1e12
+        
+        try:
+            result = minimize(
+                penalty_objective,
+                x_guess,
+                method='L-BFGS-B',
+                bounds=bounds,
+                options={
+                    'maxiter': 500,
+                    'ftol': 1e-6,
+                    'gtol': 1e-6,
+                    'disp': False
+                }
+            )
+            
+            if result.fun < 1e6:  # Reasonable cost
+                print(f"  ✓ Alternative init converged (cost: {result.fun:.2f})")
+                return result
+            else:
+                print(f"  ✗ Alternative init failed (cost: {result.fun:.2e})")
+                return None
+                
+        except Exception as e:
+            print(f"  ✗ Alternative init error: {e}")
+            return None
+    
+    def _refine_solution(self, initial_result):
+        """Add complexity gradually"""
+        x_current = initial_result.x
+        
+        # Objective with fuel cost
+        def refined_objective(x):
+            n = self.n_nodes
+            tf = x[-1]
+            
+            # Time and fuel costs
+            cost = 0.01 * tf
+            
+            # Add fuel consumption
+            for i in range(n-1):
+                idx = i * 9
+                m_i = x[idx + 5]
+                m_next = x[idx + 9 + 5]
+                fuel_used = m_i - m_next
+                cost += max(fuel_used, 0)  # Only positive fuel consumption
+            
+            # Moderate control penalties
+            for i in range(n):
+                idx = i * 9
+                gamma = x[idx + 6]
+                mu = x[idx + 7]
+                cost += 10.0 * (gamma**2 + mu**2)
+            
+            # Terminal cost
+            end_idx = (n-1) * 9
+            cost += 5000.0 * (
+                (x[end_idx] - self.xf[0])**2 + 
+                (x[end_idx + 1] - self.xf[1])**2 + 
+                (x[end_idx + 2] - self.xf[2])**2 / 1e6
+            )
+            
+            return cost
+        
+        # Same constraints as before
+        def refined_constraints(x):
+            constraints = []
+            n = self.n_nodes
+            tf = x[-1]
+            dt = tf / (n - 1)
+            
+            # Initial conditions
+            for i in range(6):
+                constraints.append(x[i] - self.x0[i])
+            
+            # Dynamics
+            for i in range(n-1):
+                idx_i = i * 9
+                idx_ip1 = idx_i + 9
+                
+                state_i = x[idx_i:idx_i+6]
+                controls_i = x[idx_i+6:idx_i+9]
+                state_ip1 = x[idx_ip1:idx_ip1+6]
+                
+                deriv_i = self.aircraft.dynamics(0, state_i, controls_i)
+                
+                for j in range(6):
+                    predicted = state_i[j] + dt * deriv_i[j]
+                    constraints.append(state_ip1[j] - predicted)
+            
+            # Terminal constraints
+            end_idx = (n-1) * 9
+            for i in range(3):
+                constraints.append(x[end_idx + i] - self.xf[i])
+            
+            # Mass should decrease
+            for i in range(n-1):
+                idx_i = i * 9
+                idx_ip1 = idx_i + 9
+                constraints.append(x[idx_ip1 + 5] - x[idx_i + 5])
+            
+            return np.array(constraints)
+        
+        # Tighter bounds
+        bounds = []
+        for i in range(self.n_nodes):
+            bounds.extend([
+                (-60, 60), (30, 70), (1000, 12000),  # Position bounds
+                (150, 300), (0, 2*np.pi), (self.x0[5]*0.7, self.x0[5]),  # V, psi, m
+                (-0.05, 0.05), (-np.pi/18, np.pi/18), (0.5, 0.8)  # Controls
+            ])
+        bounds.append((self.tf_guess * 0.8, self.tf_guess * 1.5))
+        
+        try:
+            result = minimize(
+                refined_objective,
+                x_current,
+                method='SLSQP',
+                bounds=bounds,
+                constraints={'type': 'eq', 'fun': refined_constraints},
+                options={
+                    'maxiter': 300,
+                    'ftol': 1e-6,
+                    'eps': 1e-4,
+                    'disp': False
+                }
+            )
+            
+            if result.success:
+                print(f"  ✓ Refinement converged (cost: {result.fun:.2f})")
+                return result
+            else:
+                print(f"  ✗ Refinement failed, using previous solution")
+                return initial_result
+                
+        except Exception as e:
+            print(f"  ✗ Refinement error: {e}")
+            return initial_result
+    
+    def _final_polish(self, current_result):
+        """Final high-precision optimization"""
+        try:
+            # Use the full objective from DirectCollocation
+            final_optimizer = DirectCollocation(self.aircraft, self.x0, self.xf, self.n_nodes)
+            
+            # Use current solution as starting point
+            x_current = current_result.x
+            bounds = final_optimizer.setup_optimization()[1]
+            
+            result = minimize(
+                final_optimizer.objective_function,
+                x_current,
+                method='SLSQP',
+                bounds=bounds,
+                constraints={'type': 'eq', 'fun': final_optimizer.constraint_function},
+                options={
+                    'maxiter': 200,
+                    'ftol': 1e-8,
+                    'eps': 1e-6,
+                    'disp': False
+                }
+            )
+            
+            if result.success:
+                print(f"  ✓ Final polish converged (cost: {result.fun:.2f})")
+                return result
+            else:
+                print(f"  ✗ Final polish failed, using previous solution")
+                return current_result
+                
+        except Exception as e:
+            print(f"  ✗ Final polish error: {e}")
+            return current_result
+    
+    def _create_simple_guess(self):
+        """Create simple initial guess"""
+        x_guess = np.zeros(self.n_nodes * 9 + 1)
+        
+        # Simple interpolation guess
+        for i in range(self.n_nodes):
+            idx = i * 9
+            alpha = i / (self.n_nodes - 1)
+            
+            x_guess[idx] = self.x0[0] + alpha * (self.xf[0] - self.x0[0])
+            x_guess[idx + 1] = self.x0[1] + alpha * (self.xf[1] - self.x0[1])
+            x_guess[idx + 2] = self.x0[2] + alpha * (self.xf[2] - self.x0[2])
+            x_guess[idx + 3] = self.x0[3]
+            x_guess[idx + 4] = self.x0[4]
+            x_guess[idx + 5] = self.x0[5] * (1 - 0.01 * alpha)
+            x_guess[idx + 6] = 0.0
+            x_guess[idx + 7] = 0.0
+            x_guess[idx + 8] = 0.6
+        
+        x_guess[-1] = self.tf_guess
+        
+        # Very loose bounds
+        bounds = []
+        for i in range(self.n_nodes):
+            bounds.extend([
+                (-180, 180), (-90, 90), (0, 15000),
+                (50, 400), (0, 2*np.pi), (self.x0[5]*0.5, self.x0[5]*1.1),
+                (-0.2, 0.2), (-np.pi/4, np.pi/4), (0.1, 1.0)
+            ])
+        bounds.append((self.tf_guess * 0.3, self.tf_guess * 3.0))
+        
+        return x_guess, bounds
+    
+    def _extract_solution(self, result):
+        """Extract solution from optimization result"""
+        if result is None:
+            return None, None, None, False
+        
+        x_opt = result.x
+        tf = x_opt[-1]
+        
+        t = np.linspace(0, tf, self.n_nodes)
+        states = np.zeros((self.n_nodes, 6))
+        controls = np.zeros((self.n_nodes, 3))
+        
+        for i in range(self.n_nodes):
+            idx = i * 9
+            states[i] = x_opt[idx:idx+6]
+            controls[i] = x_opt[idx+6:idx+9]
+        
+        # Check convergence quality
+        end_error = np.sqrt((states[-1, 0] - self.xf[0])**2 + 
+                           (states[-1, 1] - self.xf[1])**2)
+        alt_error = abs(states[-1, 2] - self.xf[2])
+        
+        success = (end_error < 0.05 and alt_error < 100)
+        
+        print(f"  Final solution: pos_error={end_error:.4f}°, alt_error={alt_error:.1f}m")
+        
+        return t, states, controls, success
+
+def solve_with_multiple_starts(aircraft, initial_state, target_state, n_nodes=20, n_starts=5):
+    """Try multiple random starting points to find global minimum"""
+    
+    best_result = None
+    best_cost = float('inf')
+    
+    print(f"Trying {n_starts} different starting points...")
+    
+    for start_idx in range(n_starts):
+        print(f"  Attempt {start_idx + 1}/{n_starts}...")
+        
+        # Create randomized initial guess
+        x_guess = create_randomized_guess(initial_state, target_state, n_nodes, start_idx)
+        
+        # Solve with this guess
+        optimizer = DirectCollocation(aircraft, initial_state, target_state, n_nodes)
+        setup = optimizer.setup_optimization()
+        bounds = setup[1]
+        
+        try:
+            # First with loose tolerances
+            result = minimize(
+                optimizer.objective_function,
+                x_guess,
+                method='SLSQP',
+                bounds=bounds,
+                constraints={'type': 'eq', 'fun': optimizer.constraint_function},
+                options={
+                    'maxiter': 200,
+                    'ftol': 1e-4,
+                    'eps': 1e-3,
+                    'disp': False
+                }
+            )
+            
+            if hasattr(result, 'fun') and result.fun < best_cost:
+                best_cost = result.fun
+                best_result = result
+                print(f"    New best: cost = {result.fun:.2f}")
+            
+        except Exception as e:
+            print(f"    Failed: {e}")
+            continue
+    
+    if best_result is not None:
+        print(f"Best solution found with cost: {best_cost:.2f}")
+        
+        # Polish the best result
+        try:
+            final_result = minimize(
+                optimizer.objective_function,
+                best_result.x,
+                method='SLSQP',
+                bounds=bounds,
+                constraints={'type': 'eq', 'fun': optimizer.constraint_function},
+                options={
+                    'maxiter': 100,
+                    'ftol': 1e-8,
+                    'eps': 1e-6,
+                    'disp': False
+                }
+            )
+            
+            if final_result.success:
+                print(f"Final polish successful: cost = {final_result.fun:.2f}")
+                return extract_solution_from_result(final_result, n_nodes)
+            else:
+                return extract_solution_from_result(best_result, n_nodes)
+                
+        except:
+            return extract_solution_from_result(best_result, n_nodes)
+    
+    print("All attempts failed!")
+    return None, None, None, False
+
+
+def create_randomized_guess(initial_state, target_state, n_nodes, seed):
+    """Create randomized but reasonable initial guess"""
+    np.random.seed(seed * 42)  # Different seed for each attempt
+    
+    x_guess = np.zeros(n_nodes * 9 + 1)
+    
+    # Calculate basic path parameters
+    dx = target_state[0] - initial_state[0]
+    dy = target_state[1] - initial_state[1]
+    dh = target_state[2] - initial_state[2]
+    
+    # Random path variation
+    path_noise = 0.5  # Degrees of random deviation
+    
+    for i in range(n_nodes):
+        idx = i * 9
+        alpha = i / (n_nodes - 1)
+        
+        # Add random deviations to basic interpolation
+        noise_x = np.random.uniform(-path_noise, path_noise)
+        noise_y = np.random.uniform(-path_noise, path_noise)
+        
+        x_guess[idx] = initial_state[0] + alpha * dx + noise_x
+        x_guess[idx + 1] = initial_state[1] + alpha * dy + noise_y
+        x_guess[idx + 2] = initial_state[2] + alpha * dh
+        
+        # Random speed variation
+        speed_var = np.random.uniform(0.9, 1.1)
+        x_guess[idx + 3] = initial_state[3] * speed_var
+        
+        # Random heading (but generally towards target)
+        base_heading = np.arctan2(dy, dx)
+        if base_heading < 0:
+            base_heading += 2*np.pi
+        heading_noise = np.random.uniform(-np.pi/6, np.pi/6)
+        x_guess[idx + 4] = base_heading + heading_noise
+        
+        # Mass decrease with small random variation
+        mass_factor = 1 - alpha * (0.02 + np.random.uniform(-0.005, 0.005))
+        x_guess[idx + 5] = initial_state[5] * mass_factor
+        
+        # Random controls within reasonable ranges
+        x_guess[idx + 6] = np.random.uniform(-0.02, 0.02)  # Flight path angle
+        x_guess[idx + 7] = np.random.uniform(-np.pi/24, np.pi/24)  # Bank angle
+        x_guess[idx + 8] = np.random.uniform(0.55, 0.75)  # Throttle
+    
+    # Random time estimate
+    base_time = np.sqrt(dx**2 + dy**2) * 111000 / 200  # Conservative estimate
+    time_factor = np.random.uniform(0.8, 1.2)
+    x_guess[-1] = base_time * time_factor
+    
+    return x_guess
+
+
+def extract_solution_from_result(result, n_nodes):
+    """Extract solution from optimization result"""
+    x_opt = result.x
+    tf = x_opt[-1]
+    
+    t = np.linspace(0, tf, n_nodes)
+    states = np.zeros((n_nodes, 6))
+    controls = np.zeros((n_nodes, 3))
+    
+    for i in range(n_nodes):
+        idx = i * 9
+        states[i] = x_opt[idx:idx+6]
+        controls[i] = x_opt[idx+6:idx+9]
+    
+    return t, states, controls, result.success
+
 def solve_flight_plan(flight_plan_number):
     aircraft = AircraftModel()
     
@@ -1151,16 +1733,285 @@ def fix_control_oscillations(controls):
     
     return fixed_controls
 
+def solve_with_penalty_method(aircraft, initial_state, target_state, n_nodes=15):
+    """Solve using penalty method (unconstrained optimization)"""
+    
+    def penalty_objective(x):
+        try:
+            n = n_nodes
+            tf = x[-1]
+            dt = tf / (n - 1)
+            
+            # Basic costs
+            cost = 0.01 * tf  # Time cost
+            
+            # Fuel cost
+            for i in range(n-1):
+                idx = i * 9
+                m_diff = x[idx + 5] - x[idx + 9 + 5]
+                cost += max(m_diff, 0)  # Only positive fuel consumption
+            
+            # PENALTY FOR INITIAL CONDITIONS
+            for i in range(6):
+                error = x[i] - initial_state[i]
+                cost += 100000.0 * error**2
+            
+            # PENALTY FOR DYNAMICS VIOLATIONS
+            dynamics_penalty = 0.0
+            for i in range(n-1):
+                idx_i = i * 9
+                idx_ip1 = idx_i + 9
+                
+                state_i = x[idx_i:idx_i+6]
+                controls_i = x[idx_i+6:idx_i+9]
+                state_ip1 = x[idx_ip1:idx_ip1+6]
+                
+                # Calculate dynamics
+                deriv_i = aircraft.dynamics(0, state_i, controls_i)
+                
+                # Penalty for dynamics violation
+                for j in range(6):
+                    predicted = state_i[j] + dt * deriv_i[j]
+                    error = state_ip1[j] - predicted
+                    dynamics_penalty += 10000.0 * error**2
+            
+            cost += dynamics_penalty
+            
+            # PENALTY FOR TERMINAL CONDITIONS
+            end_idx = (n-1) * 9
+            for i in range(3):  # x, y, h
+                error = x[end_idx + i] - target_state[i]
+                if i < 2:  # Position
+                    cost += 100000.0 * error**2
+                else:  # Altitude
+                    cost += 1000.0 * error**2
+            
+            # Control smoothness penalty
+            for i in range(n):
+                idx = i * 9
+                gamma = x[idx + 6]
+                mu = x[idx + 7]
+                cost += 100.0 * (gamma**2 + mu**2)
+            
+            # Mass consistency penalty
+            for i in range(n-1):
+                idx_i = i * 9
+                idx_ip1 = idx_i + 9
+                mass_change = x[idx_i + 5] - x[idx_ip1 + 5]
+                if mass_change < 0:  # Mass increased
+                    cost += 50000.0 * mass_change**2
+            
+            return cost
+            
+        except Exception as e:
+            return 1e12
+    
+    # Create initial guess
+    x_guess = np.zeros(n_nodes * 9 + 1)
+    
+    for i in range(n_nodes):
+        idx = i * 9
+        alpha = i / (n_nodes - 1)
+        
+        # Simple interpolation
+        x_guess[idx] = initial_state[0] + alpha * (target_state[0] - initial_state[0])
+        x_guess[idx + 1] = initial_state[1] + alpha * (target_state[1] - initial_state[1])
+        x_guess[idx + 2] = initial_state[2] + alpha * (target_state[2] - initial_state[2])
+        x_guess[idx + 3] = initial_state[3]
+        x_guess[idx + 4] = initial_state[4]
+        x_guess[idx + 5] = initial_state[5] * (1 - 0.015 * alpha)
+        
+        # Simple controls
+        x_guess[idx + 6] = 0.0
+        x_guess[idx + 7] = 0.0 
+        x_guess[idx + 8] = 0.65
+    
+    # Time estimate
+    dist = np.sqrt((target_state[0] - initial_state[0])**2 + 
+                   (target_state[1] - initial_state[1])**2) * 111000
+    x_guess[-1] = dist / 200  # Conservative speed
+    
+    # Bounds
+    bounds = []
+    for i in range(n_nodes):
+        bounds.extend([
+            (-180, 180), (-90, 90), (1000, 15000),  # Position
+            (100, 350), (0, 2*np.pi), (initial_state[5]*0.6, initial_state[5]),  # V, psi, m
+            (-0.1, 0.1), (-np.pi/12, np.pi/12), (0.4, 0.9)  # Controls
+        ])
+    bounds.append((x_guess[-1] * 0.5, x_guess[-1] * 2.0))
+    
+    # Solve unconstrained problem
+    try:
+        result = minimize(
+            penalty_objective,
+            x_guess,
+            method='L-BFGS-B',
+            bounds=bounds,
+            options={
+                'maxiter': 1000,
+                'ftol': 1e-6,
+                'gtol': 1e-6,
+                'disp': False
+            }
+        )
+        
+        if result.fun < 1e6:  # Reasonable cost indicates convergence
+            t, states, controls = extract_solution_from_result(result, n_nodes)
+            
+            # Check solution quality
+            end_error = np.sqrt((states[-1, 0] - target_state[0])**2 + 
+                               (states[-1, 1] - target_state[1])**2)
+            alt_error = abs(states[-1, 2] - target_state[2])
+            
+            success = (end_error < 0.1 and alt_error < 200)
+            print(f"  Penalty method result: cost={result.fun:.2f}, pos_error={end_error:.4f}°, alt_error={alt_error:.1f}m")
+            
+            return t, states, controls, success
+        else:
+            print(f"  Penalty method failed: cost too high ({result.fun:.2e})")
+            return None, None, None, False
+            
+    except Exception as e:
+        print(f"  Penalty method error: {e}")
+        return None, None, None, False
 
-def main():
+
+def solve_flight_plan_enhanced_convergence(flight_plan_number):
+    aircraft = AircraftModel()
+    
+    flight_plans = {
+        1: {
+            'initial': {
+                'lon': 5, 'lat': 40, 'h': 8000, 'v': 210, 'psi': 0, 'm': 68000
+            },
+            'destination': {
+                'lon': 32, 'lat': 40, 'h': 8000
+            }
+        },
+        2: {
+            'initial': {
+                'lon': 30, 'lat': 55, 'h': 7000, 'v': 220, 'psi': 40 * np.pi/180, 'm': 67000
+            },
+            'destination': {
+                'lon': 15, 'lat': 40, 'h': 9000
+            }
+        },
+        3: {
+            'initial': {
+                'lon': 32, 'lat': 45, 'h': 8000, 'v': 210, 'psi': 180 * np.pi/180, 'm': 65000
+            },
+            'destination': {
+                'lon': 5, 'lat': 45, 'h': 7000
+            }
+        }
+    }
+    
+    plan = flight_plans[flight_plan_number]
+    initial_state = [
+        plan['initial']['lon'], plan['initial']['lat'], plan['initial']['h'],
+        plan['initial']['v'], plan['initial']['psi'], plan['initial']['m']
+    ]
+    target_state = [
+        plan['destination']['lon'], plan['destination']['lat'], plan['destination']['h'],
+        0, 0, 0
+    ]
+    
+    print(f"\n{'='*60}")
+    print(f"ENHANCED CONVERGENCE - FLIGHT PLAN {flight_plan_number}")
+    print(f"{'='*60}")
+    
+    # Strategy 1: Enhanced Gradual Convergence
+    print("\n🔄 Strategy 1: Enhanced gradual convergence...")
+    try:
+        optimizer1 = ConvergenceEnhancedCollocation(aircraft, initial_state, target_state, n_nodes=18)
+        t1, states1, controls1, success1 = optimizer1.solve()
+        
+        if success1:
+            print("✅ Strategy 1 CONVERGED successfully!")
+            return finalize_solution(t1, states1, controls1, flight_plan_number, "Enhanced Gradual")
+    except Exception as e:
+        print(f"❌ Strategy 1 failed: {e}")
+    
+    # Strategy 2: Multiple Random Starts
+    print("\n🎲 Strategy 2: Multiple random starts...")
+    try:
+        t2, states2, controls2, success2 = solve_with_multiple_starts(
+            aircraft, initial_state, target_state, n_nodes=16, n_starts=7
+        )
+        
+        if success2:
+            print("✅ Strategy 2 CONVERGED successfully!")
+            return finalize_solution(t2, states2, controls2, flight_plan_number, "Multiple Starts")
+    except Exception as e:
+        print(f"❌ Strategy 2 failed: {e}")
+    
+    # Strategy 3: Penalty Method (Unconstrained)
+    print("\n🎯 Strategy 3: Penalty method...")
+    try:
+        t3, states3, controls3, success3 = solve_with_penalty_method(
+            aircraft, initial_state, target_state, n_nodes=15
+        )
+        
+        if success3:
+            print("✅ Strategy 3 CONVERGED successfully!")
+            return finalize_solution(t3, states3, controls3, flight_plan_number, "Penalty Method")
+    except Exception as e:
+        print(f"❌ Strategy 3 failed: {e}")
+    
+    # Strategy 4: Relaxed Fallback (Previous method)
+    print("\n🔄 Strategy 4: Relaxed fallback...")
+    try:
+        result = solve_flight_plan(flight_plan_number)
+        if result[0] is not None:
+            print("✅ Strategy 4 found acceptable solution!")
+            return result
+    except Exception as e:
+        print(f"❌ Strategy 4 failed: {e}")
+    
+    print("❌ ALL CONVERGENCE STRATEGIES FAILED!")
+    return None, None, None, None, None
+
+
+def finalize_solution(t, states, controls, flight_plan_number, method_name):
+    """Finalize and post-process a converged solution"""
+    
+    # Calculate metrics
+    flight_time = t[-1]
+    initial_mass = states[0, 5]
+    final_mass = states[-1, 5]
+    fuel_consumption = initial_mass - final_mass
+    
+    # Calculate distance
+    dx = states[-1, 0] - states[0, 0]
+    dy = states[-1, 1] - states[0, 1]
+    dist_km = np.sqrt(dx**2 + dy**2) * 111.32
+    
+    # Post-process for better results
+    fixed_controls = fix_control_oscillations(controls)
+    
+    print(f"\n🎉 SUCCESS - {method_name} method converged!")
+    print(f"📊 RESULTS:")
+    print(f"   Flight time: {flight_time/60:.2f} minutes")
+    print(f"   Fuel consumption: {fuel_consumption:.2f} kg")
+    print(f"   Average speed: {dist_km/(flight_time/3600):.1f} km/h")
+    print(f"   Fuel efficiency: {dist_km/fuel_consumption:.2f} km/kg")
+    
+    # Plot results
+    plot_results(t, states, fixed_controls, flight_plan_number)
+    
+    return t, states, fixed_controls, flight_time, fuel_consumption
+
+
+def main_enhanced():
     results = {}
     
     for flight_plan in [1, 2, 3]:
-        print(f"\n{'='*50}")
-        print(f"Solving Flight Plan {flight_plan}...")
-        print(f"{'='*50}")
+        print(f"\n{'='*80}")
+        print(f"🛫 PROCESSING FLIGHT PLAN {flight_plan}")
+        print(f"{'='*80}")
         
-        result = solve_flight_plan(flight_plan)
+        result = solve_flight_plan_enhanced_convergence(flight_plan)
         
         if result[0] is not None:
             t, states, controls, flight_time, fuel_consumption = result
@@ -1169,48 +2020,97 @@ def main():
                 'fuel_consumption': fuel_consumption,
                 'success': True
             }
-            print(f"✓ Flight Plan {flight_plan} completed successfully!")
         else:
             results[flight_plan] = {
                 'flight_time': None,
                 'fuel_consumption': None,
                 'success': False
             }
-            print(f"✗ Flight Plan {flight_plan} failed!")
     
-    # Summary
-    print("\n" + "="*80)
-    print("FINAL SUMMARY OF RESULTS")
-    print("="*80)
-    print("Flight Plan | Status  | Flight Time (min) | Fuel Consumption (kg)")
-    print("-"*80)
+    # Final summary
+    print(f"\n{'='*80}")
+    print("🎯 FINAL CONVERGENCE SUMMARY")
+    print(f"{'='*80}")
+    print("Flight Plan | Status    | Time (min) | Fuel (kg)")
+    print("-" * 50)
     
     for flight_plan, result in results.items():
         if result['success']:
-            status = "SUCCESS"
-            flight_time_str = f"{result['flight_time']/60:15.1f}"
-            fuel_str = f"{result['fuel_consumption']:18.1f}"
+            status = "CONVERGED"
+            time_str = f"{result['flight_time']/60:8.1f}"
+            fuel_str = f"{result['fuel_consumption']:8.1f}"
         else:
-            status = "FAILED "
-            flight_time_str = "N/A".rjust(15)
-            fuel_str = "N/A".rjust(18)
+            status = "FAILED   "
+            time_str = "     N/A"
+            fuel_str = "     N/A"
         
-        print(f"{flight_plan:11d} | {status} | {flight_time_str} | {fuel_str}")
+        print(f"{flight_plan:11d} | {status} | {time_str} | {fuel_str}")
     
-    print("="*80)
+    print(f"{'='*50}")
     
-    # Analysis of successful flights
-    successful_flights = [fp for fp, res in results.items() if res['success']]
-    if successful_flights:
-        print(f"\n📊 Analysis of {len(successful_flights)} successful flight(s):")
-        total_time = sum(results[fp]['flight_time']/60 for fp in successful_flights)
-        total_fuel = sum(results[fp]['fuel_consumption'] for fp in successful_flights)
-        print(f"   • Total flying time: {total_time:.1f} minutes")
-        print(f"   • Total fuel consumption: {total_fuel:.1f} kg")
-        print(f"   • Average fuel efficiency: {total_fuel/len(successful_flights):.1f} kg per flight")
-    
-    print(f"\n🎯 Optimization completed for all {len(results)} flight plans.")
+    successful_count = sum(1 for r in results.values() if r['success'])
+    print(f"✅ SUCCESS RATE: {successful_count}/3 ({successful_count/3*100:.0f}%)")
 
 
+# Son olarak main çağrısını değiştir:
 if __name__ == "__main__":
-    main()
+    main_enhanced()  # Bu satırı değiştir
+
+# def main():
+#     results = {}
+    
+#     for flight_plan in [1, 2, 3]:
+#         print(f"\n{'='*50}")
+#         print(f"Solving Flight Plan {flight_plan}...")
+#         print(f"{'='*50}")
+        
+#         result = solve_flight_plan(flight_plan)
+        
+#         if result[0] is not None:
+#             t, states, controls, flight_time, fuel_consumption = result
+#             results[flight_plan] = {
+#                 'flight_time': flight_time,
+#                 'fuel_consumption': fuel_consumption,
+#                 'success': True
+#             }
+#             print(f"✓ Flight Plan {flight_plan} completed successfully!")
+#         else:
+#             results[flight_plan] = {
+#                 'flight_time': None,
+#                 'fuel_consumption': None,
+#                 'success': False
+#             }
+#             print(f"✗ Flight Plan {flight_plan} failed!")
+    
+#     # Summary
+#     print("\n" + "="*80)
+#     print("FINAL SUMMARY OF RESULTS")
+#     print("="*80)
+#     print("Flight Plan | Status  | Flight Time (min) | Fuel Consumption (kg)")
+#     print("-"*80)
+    
+#     for flight_plan, result in results.items():
+#         if result['success']:
+#             status = "SUCCESS"
+#             flight_time_str = f"{result['flight_time']/60:15.1f}"
+#             fuel_str = f"{result['fuel_consumption']:18.1f}"
+#         else:
+#             status = "FAILED "
+#             flight_time_str = "N/A".rjust(15)
+#             fuel_str = "N/A".rjust(18)
+        
+#         print(f"{flight_plan:11d} | {status} | {flight_time_str} | {fuel_str}")
+    
+#     print("="*80)
+    
+#     # Analysis of successful flights
+#     successful_flights = [fp for fp, res in results.items() if res['success']]
+#     if successful_flights:
+#         print(f"\n📊 Analysis of {len(successful_flights)} successful flight(s):")
+#         total_time = sum(results[fp]['flight_time']/60 for fp in successful_flights)
+#         total_fuel = sum(results[fp]['fuel_consumption'] for fp in successful_flights)
+#         print(f"   • Total flying time: {total_time:.1f} minutes")
+#         print(f"   • Total fuel consumption: {total_fuel:.1f} kg")
+#         print(f"   • Average fuel efficiency: {total_fuel/len(successful_flights):.1f} kg per flight")
+    
+#     print(f"\n🎯 Optimization completed for all {len(results)} flight plans.")
