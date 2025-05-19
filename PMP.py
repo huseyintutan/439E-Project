@@ -318,7 +318,10 @@ class DirectCollocation:
     def solve(self):
         x_guess, bounds, n_constraints = self.setup_optimization()
         
-        # First attempt with looser tolerances to get closer to solution
+        # Multiple phase optimization strategy for smoother trajectories
+        
+        # Phase 1: Initial rough optimization to get into feasible region
+        print("Phase 1: Initial rough optimization...")
         result = minimize(
             self.objective_function,
             x_guess,
@@ -326,16 +329,57 @@ class DirectCollocation:
             bounds=bounds,
             constraints={'type': 'eq', 'fun': self.constraint_function},
             options={
-                'maxiter': 300,
-                'ftol': 1e-6,
-                'eps': 1e-3,
+                'maxiter': 100,
+                'ftol': 1e-4,
+                'eps': 1e-2,
                 'disp': True
             }
         )
         
-        # Refine solution with tighter tolerances
+        # Phase 2: Tighter controls for smoothness if Phase 1 was reasonably successful
+        if result.success or (hasattr(result, 'fun') and result.fun < 1e6):
+            print("Phase 2: Smoothness optimization with tighter bounds...")
+            
+            # Create tighter bounds to restrict excessive maneuvers
+            bounds_tight = []
+            for i in range(self.n_nodes):
+                # State bounds (keep same as before)
+                bounds_tight.extend([
+                    (0, 60),                           # x (longitude)
+                    (35, 60),                          # y (latitude)  
+                    (5000, 12000),                     # h (altitude)
+                    (150, 270),                        # v (speed)
+                    (-2*np.pi, 2*np.pi),              # psi (heading)
+                    (self.x0[5]*0.8, self.x0[5])      # m (mass)
+                ])
+                
+                # Tighter control bounds to prevent oscillations
+                bounds_tight.extend([
+                    (-0.08, 0.08),        # gamma: Tighter flight path angle (±4.6°)
+                    (-np.pi/10, np.pi/10), # mu: Tighter bank angle (±18°)
+                    (0.35, 0.75)          # delta: Tighter throttle range
+                ])
+            
+            # Tighter time bounds
+            bounds_tight.append((self.tf_guess * 0.85, self.tf_guess * 1.15))
+            
+            result = minimize(
+                self.objective_function,
+                result.x,
+                method='SLSQP',
+                bounds=bounds_tight,
+                constraints={'type': 'eq', 'fun': self.constraint_function},
+                options={
+                    'maxiter': 200,
+                    'ftol': 1e-6,
+                    'eps': 1e-4,
+                    'disp': True
+                }
+            )
+        
+        # Phase 3: Final polishing with original bounds if Phase 2 was successful
         if result.success:
-            print("Initial optimization successful, refining solution...")
+            print("Phase 3: Final polishing with original bounds...")
             result = minimize(
                 self.objective_function,
                 result.x,
@@ -343,42 +387,96 @@ class DirectCollocation:
                 bounds=bounds,
                 constraints={'type': 'eq', 'fun': self.constraint_function},
                 options={
-                    'maxiter': 200,
+                    'maxiter': 100,
                     'ftol': 1e-8,
                     'eps': 1e-5,
                     'disp': True
                 }
             )
         else:
-            print("Initial optimization did not fully converge:", result.message)
-            print("Attempting to extract usable solution anyway...")
+            print("Phase 2 did not converge well, trying alternative approach...")
+            # Alternative: Try with L-BFGS-B method which is sometimes more robust
+            result_alt = minimize(
+                self.objective_function,
+                result.x if hasattr(result, 'x') else x_guess,
+                method='L-BFGS-B',
+                bounds=bounds,
+                options={
+                    'maxiter': 300,
+                    'ftol': 1e-6,
+                    'eps': 1e-4,
+                    'disp': True
+                }
+            )
+            
+            # Use the better result
+            if (hasattr(result_alt, 'fun') and hasattr(result, 'fun') and 
+                result_alt.fun < result.fun) or not hasattr(result, 'fun'):
+                result = result_alt
         
-        # Extract results
-        x_opt = result.x
-        tf = x_opt[-1]
+        # Extract and validate results
+        if hasattr(result, 'x'):
+            x_opt = result.x
+            tf = x_opt[-1]
+            
+            # Extract states and controls
+            n = self.n_nodes
+            t = np.linspace(0, tf, n)
+            states = np.zeros((n, 6))
+            controls = np.zeros((n, 3))
+            
+            for i in range(n):
+                idx_start = i * 9
+                states[i] = x_opt[idx_start:idx_start+6]
+                controls[i] = x_opt[idx_start+6:idx_start+9]
+            
+            # Validate solution quality
+            final_pos_error = np.sqrt((states[-1, 0] - self.xf[0])**2 + 
+                                    (states[-1, 1] - self.xf[1])**2)
+            alt_error = abs(states[-1, 2] - self.xf[2])
+            
+            print(f"Optimization completed with status: {result.success}")
+            print(f"Final position error: {final_pos_error:.6f} degrees")
+            print(f"Final altitude error: {alt_error:.2f} meters")
+            print(f"Objective function value: {result.fun:.2f}")
+            
+            # Check for excessive oscillations in heading
+            heading_changes = np.diff(states[:, 4])
+            # Handle angle wrapping
+            heading_changes = np.where(heading_changes > np.pi, 
+                                    heading_changes - 2*np.pi, heading_changes)
+            heading_changes = np.where(heading_changes < -np.pi, 
+                                    heading_changes + 2*np.pi, heading_changes)
+            
+            total_heading_change = np.sum(np.abs(heading_changes))
+            print(f"Total heading change: {np.degrees(total_heading_change):.2f} degrees")
+            
+            # Check trajectory smoothness
+            bank_angles = controls[:, 1]
+            max_bank = np.max(np.abs(bank_angles))
+            avg_bank = np.mean(np.abs(bank_angles))
+            print(f"Max bank angle: {np.degrees(max_bank):.2f}°, Avg bank: {np.degrees(avg_bank):.2f}°")
+            
+            # Success criteria
+            position_ok = final_pos_error < 0.01  # Within ~1.1 km
+            altitude_ok = alt_error < 100  # Within 100 meters
+            solution_found = position_ok and altitude_ok
+            
+            if not solution_found:
+                print("WARNING: Solution may not meet accuracy requirements!")
+                print("Consider increasing number of nodes or adjusting bounds.")
+            
+            return t, states, controls, solution_found
         
-        # Extract states and controls
-        n = self.n_nodes
-        t = np.linspace(0, tf, n)
-        states = np.zeros((n, 6))
-        controls = np.zeros((n, 3))
-        
-        for i in range(n):
-            idx_start = i * 9
-            states[i] = x_opt[idx_start:idx_start+6]
-            controls[i] = x_opt[idx_start+6:idx_start+9]
-        
-        # Check final position error
-        final_pos_error = np.sqrt((states[-1, 0] - self.xf[0])**2 + 
-                                 (states[-1, 1] - self.xf[1])**2)
-        print(f"Final position error: {final_pos_error:.4f} degrees")
-        
-        # Check altitude error
-        alt_error = abs(states[-1, 2] - self.xf[2])
-        print(f"Final altitude error: {alt_error:.2f} meters")
-        
-        return t, states, controls, result.success
-
+        else:
+            print("Optimization failed to find a valid solution!")
+            print(f"Optimization message: {result.message if hasattr(result, 'message') else 'Unknown error'}")
+            
+            # Return dummy results
+            t = np.linspace(0, self.tf_guess, self.n_nodes)
+            states = np.zeros((self.n_nodes, 6))
+            controls = np.zeros((self.n_nodes, 3))
+            return t, states, controls, False
 
 def solve_flight_plan(flight_plan_number):
     aircraft = AircraftModel()
