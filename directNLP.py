@@ -239,7 +239,7 @@ class DirectCollocation:
             ddelta = x[idx_ip1 + 8] - x[idx_i + 8]
             
             # Penalize rapid control changes
-            control_smoothness_cost += 20.0 * dt * (
+            control_smoothness_cost += 100.0 * dt * (
                 (dgamma/dt)**2 + 
                 (dmu/dt)**2 + 
                 (ddelta/dt)**2
@@ -481,9 +481,9 @@ class RobustDirectCollocation:
         self.n_nodes = n_nodes
         
         # More conservative bounds
-        self.gamma_bounds = (-0.03, 0.03)  # ±1.7° flight path angle
-        self.mu_bounds = (-np.pi/24, np.pi/24)  # ±7.5° bank angle
-        self.delta_bounds = (0.5, 0.85)  # Conservative throttle range
+        self.gamma_bounds = (-0.02, 0.02)           # ±1.1° flight path angle
+        self.mu_bounds = (-np.pi/36, np.pi/36)      # ±5° bank angle
+        self.delta_bounds = (0.60, 0.72)            # cruise-only throttle
         
         # Calculate direct distance and time more accurately
         dx = self.xf[0] - self.x0[0]
@@ -536,7 +536,7 @@ class RobustDirectCollocation:
             fuel_cost += expected_fuel_consumption
             
             # Control smoothness (moderate penalties)
-            control_smoothness += 50.0 * (gamma_i**2 + mu_i**2)
+            control_smoothness += 100.0 * (gamma_i**2 + mu_i**2)
             
             # Throttle efficiency  
             if delta_i > 0.8:
@@ -565,7 +565,7 @@ class RobustDirectCollocation:
             d_psi_2 = angle_diff(psi_next, psi_curr)
             curvature = (d_psi_2 - d_psi_1) / dt**2
             
-            trajectory_smoothness += 200.0 * curvature**2
+            trajectory_smoothness += 1000.0 * curvature**2
         
         # Terminal cost
         end_idx = (n-1) * 9
