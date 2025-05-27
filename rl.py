@@ -16,7 +16,7 @@ env = FlightEnv(flight_1)
 check_env(env, warn=True)
 
 model = PPO("MlpPolicy", env, verbose=1, tensorboard_log="./ppo_log")
-model.learn(total_timesteps=100000)
+model.learn(total_timesteps=1000000)
 
 # Evaluation
 obs, _ = env.reset()

@@ -73,24 +73,20 @@ class FlightEnv(gym.Env):
         h = h + dh * dt
         v = v + dv * dt
         ψ = ψ + dψ * dt
-        m = m + dm * dt
+        m = max(m + dm * dt, 0.0)
 
         self.state = np.array([x, y, h, v, ψ, m], dtype=np.float32)
 
-        # Reward function (final version)
+        # Minimal reward shaping
         pos_error = np.linalg.norm(self.state[:2] - self.goal[:2])
         alt_error = abs(self.state[2] - self.goal[2])
+        fuel_penalty = 0.0001 * f
 
-        fuel_penalty = np.log(1 + f)
-        reward = -0.05 - fuel_penalty - 0.001 * pos_error - 0.001 * alt_error
-
-        reward += 0.2 * δ  # throttle teşviki
-
-        if δ < 0.01:
-            reward -= 0.5  # throttle = 0'a yakınsa sert ceza
+        reward = - fuel_penalty - 0.001 * pos_error - 0.001 * alt_error
+        reward += 0.1 * δ
 
         terminated = bool(pos_error < 1.0 and alt_error < 200)
-        truncated = bool(m < 40000 or v < 50 or h < 0)
+        truncated = bool(m < 20000 or v < 70 or h < 100)
 
         return self.state.astype(np.float32), reward, terminated, truncated, {}
 
