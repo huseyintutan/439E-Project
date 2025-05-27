@@ -1,0 +1,26 @@
+[
+    {
+        "flight": 1,
+        "method": "Dynamic Programming",
+        "time": 0,
+        "fuel": 0,
+        "final_position_error": Infinity,
+        "final_altitude_error": Infinity
+    },
+    {
+        "flight": 2,
+        "method": "Dynamic Programming",
+        "time": 0,
+        "fuel": 0,
+        "final_position_error": Infinity,
+        "final_altitude_error": Infinity
+    },
+    {
+        "flight": 3,
+        "method": "Dynamic Programming",
+        "time": 0,
+        "fuel": 0,
+        "final_position_error": Infinity,
+        "final_altitude_error": Infinity
+    }
+]
